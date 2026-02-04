@@ -1,0 +1,288 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <DHT.h>
+#include <driver/i2s.h>
+ 
+// ---------------- Struct ----------------
+struct SensorPayload {
+  float temperature;
+  float humidity;
+  int flame;
+  int vibration;
+  int motion;
+  int mq135;
+  int mq136;
+  float current;       // in Amps
+  float micLevel;      // RMS
+  float batteryLeft;   // mAh
+  float batteryPercent;
+};
+ 
+// ---------------- DHT Sensor ----------------
+#define DHTPIN 25
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+ 
+// ---------------- Other Sensors ----------------
+#define MQ135_PIN 34
+#define MQ136_PIN 35
+#define FLAME_PIN 32
+#define VIBRATION_PIN 27
+#define PIR_PIN 26
+#define ACS712_PIN 33
+ 
+// ---------------- I2S Microphone Pins ----------------
+#define I2S_WS 15   // LRCL
+#define I2S_SD 14   // DOUT
+#define I2S_SCK 22  // BCLK
+ 
+// ---------------- WiFi & Server ----------------
+const char* ssid = "Server4";
+const char* password = "Maximum@1";
+const char* serverName = "https://stage.agrikheti.com/api/iot/post_iot_data";
+const char* apiKeyValue = "tPmAT5AbAgrikheti3j7F9";
+ 
+String device_idName = "Mohali-test";
+String sensorLocation = "Mohali";
+ 
+// ---------------- Battery ----------------
+static float pbackup = 30000.0;      // mAh capacity of power bank
+const float batteryMax = 30000.0;    // maximum capacity
+const float loopTime_ms = 5000.0;    // matches delay in loop()
+const float targetRunHours = 70.0;   // desired total runtime in hours
+ 
+// ---------------- ACS712 Calibration ----------------
+const int ACS712_ZERO = 2076;  // calibration offset (update after calibration)
+ 
+// ---------------- I2S Setup ----------------
+void i2s_install() {
+  const i2s_config_t i2s_config = {
+    .mode = i2s_mode_t(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = 16000,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = i2s_comm_format_t(I2S_COMM_FORMAT_I2S),
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 4,
+    .dma_buf_len = 256,
+    .use_apll = false,
+    .tx_desc_auto_clear = false,
+    .fixed_mclk = 0
+  };
+ 
+  const i2s_pin_config_t pin_config = {
+    .bck_io_num = I2S_SCK,
+    .ws_io_num = I2S_WS,
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num = I2S_SD
+  };
+ 
+  i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+  i2s_set_pin(I2S_NUM_0, &pin_config);
+}
+ 
+// ---------------- Read Microphone RMS Level ----------------
+float readMicLevel() {
+  int16_t samples[256];
+  size_t bytes_read = 0;
+  const TickType_t timeoutTicks = 100 / portTICK_PERIOD_MS;
+ 
+  esp_err_t res = i2s_read(I2S_NUM_0, (char*)samples, sizeof(samples), &bytes_read, timeoutTicks);
+  if (res != ESP_OK || bytes_read == 0) {
+    Serial.println("Mic read timeout/failed -> returning 0");
+    return 0.0f;
+  }
+ 
+  int samples_read = bytes_read / 2;
+  if (samples_read <= 0) return 0.0f;
+ 
+  double sum_sq = 0;
+  for (int i = 0; i < samples_read; i++) {
+    float sample = (float)samples[i] / 32768.0f;
+    sum_sq += sample * sample;
+  }
+  return (float)sqrt(sum_sq / samples_read);
+}
+ 
+// ---------------- Read Current from ACS712 ----------------
+float readCurrent() {
+  long sum = 0;
+  const int samples = 50;
+  for (int i = 0; i < samples; i++) {
+    sum += analogRead(ACS712_PIN);
+    delayMicroseconds(200);
+  }
+  float avg_raw = sum / (float)samples;
+  float voltage = (avg_raw * 3.3f) / 4095.0f;
+  float zero_voltage = (ACS712_ZERO * 3.3f) / 4095.0f;
+  float v_diff = voltage - zero_voltage;
+  float current = v_diff / 0.066f; // 66mV per Amp (ACS712 30A)
+ 
+  if (current < 0.0f) current = 0.0f;
+  if (current < 0.02f) current = 0.02f; // small baseline
+ 
+  return current;
+}
+ 
+// ---------------- Read All Sensors ----------------
+SensorPayload readAllSensors(bool powerMQ) {
+  SensorPayload p;
+ 
+  // DHT
+  float h = dht.readHumidity();
+  float t = dht.readTemperature();
+  if (isnan(h) || isnan(t)) {
+    Serial.println("DHT read failed -> using 0,0");
+    p.humidity = 0.0f;
+    p.temperature = 0.0f;
+  } else {
+    p.humidity = h;
+    p.temperature = t;
+  }
+ 
+  p.flame = digitalRead(FLAME_PIN);
+  p.vibration = digitalRead(VIBRATION_PIN);
+  p.motion = digitalRead(PIR_PIN);
+ 
+  if (powerMQ) {
+    p.mq135 = analogRead(MQ135_PIN);
+    p.mq136 = analogRead(MQ136_PIN);
+  } else {
+    p.mq135 = 0;
+    p.mq136 = 0;
+  }
+ 
+  // Current and Mic
+  p.current = readCurrent();
+  p.micLevel = readMicLevel();
+ 
+  // ---------------- Battery Simulation (Fixed 70-hour runtime) ----------------
+  float dischargePerCycle = batteryMax / (targetRunHours * 3600.0 / (loopTime_ms / 1000.0)); // mAh per loop
+  pbackup -= dischargePerCycle;
+  if (pbackup < 0) pbackup = 0;
+  if (pbackup > batteryMax) pbackup = batteryMax;
+ 
+  p.batteryLeft = pbackup;
+  p.batteryPercent = (pbackup / batteryMax) * 100.0f;
+ 
+  return p;
+}
+ 
+// ---------------- Send Data to Server ----------------
+void sendToServer(const SensorPayload &p) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected - skipping send");
+    return;
+  }
+ 
+  HTTPClient http;
+  if (!http.begin(serverName)) {
+    Serial.println("HTTP begin failed");
+    return;
+  }
+ 
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+ 
+  String httpRequestData = "api_key=" + String(apiKeyValue) +
+                           "&temperature=" + String(p.temperature, 2) +
+                           "&humidity=" + String(p.humidity, 2) +
+                           "&fire=" + String(p.flame) +
+                           "&vibration=" + String(p.vibration) +
+                           "&motion=" + String(p.motion) +
+                           "&smoke=" + String(p.mq135) +
+                           "&htos=" + String(p.mq136) +
+                           "&current=" + String(p.current, 3) +
+                           "&micLevel=" + String(p.micLevel, 5) +
+                           "&battery=" + String(p.batteryLeft, 2) +
+                           "&battery_percent=" + String(p.batteryPercent, 1) +
+                           "&location=" + sensorLocation +
+                           "&device_id=" + device_idName;
+ 
+  Serial.println("Sending: " + httpRequestData);
+ 
+  int httpResponseCode = http.POST(httpRequestData);
+  Serial.printf("API Response: %d\n", httpResponseCode);
+ 
+  if (httpResponseCode > 0) {
+    String response = http.getString();
+    Serial.println("Response: " + response);
+  } else {
+    Serial.printf("HTTP Post failed, error: %s\n", http.errorToString(httpResponseCode).c_str());
+  }
+ 
+  http.end();
+}
+ 
+// ---------------- WiFi Reconnect ----------------
+void ensureWiFiConnected() {
+  if (WiFi.status() == WL_CONNECTED) return;
+ 
+  Serial.println("WiFi disconnected. Attempting reconnect...");
+  WiFi.disconnect();
+  WiFi.begin(ssid, password);
+ 
+  unsigned long start = millis();
+  const unsigned long timeout = 10000;
+  while (WiFi.status() != WL_CONNECTED && millis() - start < timeout) {
+    delay(500);
+    Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi reconnected!");
+  } else {
+    Serial.println("\nReconnection failed.");
+  }
+}
+ 
+// ---------------- Setup ----------------
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+ 
+  dht.begin();
+  pinMode(FLAME_PIN, INPUT);
+  pinMode(VIBRATION_PIN, INPUT);
+  pinMode(PIR_PIN, INPUT);
+ 
+  i2s_install();
+ 
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
+    delay(500);
+    Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) Serial.println("\nWiFi Connected!");
+  else Serial.println("\nWiFi connect attempt timed out - continuing, will retry in loop.");
+ 
+  Serial.println("Target battery runtime: 70 hours");
+}
+ 
+// ---------------- Loop ----------------
+void loop() {
+  static int cycle = 0;
+  bool powerMQ = (cycle % 2 == 0);  // read MQ sensors every other cycle
+ 
+  if (WiFi.status() != WL_CONNECTED) {
+    ensureWiFiConnected();
+  }
+ 
+  SensorPayload payload = readAllSensors(powerMQ);
+ 
+  Serial.printf("Temp: %.2f °C, Hum: %.2f %%\n", payload.temperature, payload.humidity);
+  Serial.printf("Flame: %d, Vib: %d, Motion: %d\n", payload.flame, payload.vibration, payload.motion);
+  Serial.printf("MQ135: %d, MQ136: %d, Current: %.3f A\n", payload.mq135, payload.mq136, payload.current);
+  Serial.printf("Mic Level (RMS): %.5f\n", payload.micLevel);
+  Serial.printf("Battery Left (est): %.2f mAh (%.1f%%)\n", payload.batteryLeft, payload.batteryPercent);
+ 
+  if (WiFi.status() == WL_CONNECTED) {
+    sendToServer(payload);
+  } else {
+    Serial.println("Skipping send: no WiFi connection");
+  }
+ 
+  cycle++;
+  yield();
+  delay(loopTime_ms);
+}
