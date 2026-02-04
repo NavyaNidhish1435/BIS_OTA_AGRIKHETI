@@ -1,0 +1,263 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <ArduinoOTA.h>
+#include <ESPmDNS.h>
+#include <WiFiUdp.h>
+ 
+/**********************
+   WIFI DETAILS
+**********************/
+const char* ssid = "Server1";
+const char* password = "Maximum@1";
+ 
+/**********************
+   API DETAILS
+**********************/
+const char* api_url = "https://gwtpl.co/api/monitoring/add_battery_data";
+const char* api_host = "gwtpl.co";
+const uint16_t api_port = 443;
+const char* api_key = "6513d871943f3acaf3ef2dee663980bb2087ef2a0a1f9028367906c8d1ffe375";
+ 
+const int MAX_ATTEMPTS = 6;
+const unsigned long TIMEOUT_MS = 60000;
+const unsigned long BASE_BACKOFF = 2000;
+ 
+/**********************
+   PIN CONFIG
+**********************/
+#define ZMPT_PIN 35
+#define DC_PIN   34
+ 
+/**********************
+   AC DETECTION CONFIG
+**********************/
+int ac_threshold = 650;
+static int acState = 0;
+static unsigned long lastChangeTime = 0;
+ 
+/**********************
+   DC & BATTERY CONFIG
+**********************/
+float raw_46 = 2704.0;
+float raw_58 = 3680.0;
+float slope1 = 46.0 / raw_46;
+float slope2 = (58.0 - 46.0) / (raw_58 - raw_46);
+ 
+/* 48V lithium limits */
+float batt_min = 41.0;
+float batt_max = 54.0;
+ 
+/**********************
+   48V LITHIUM FILTER TUNING
+**********************/
+#define DC_SAMPLES 80
+#define VOLT_ALPHA 0.08
+#define PERC_ALPHA 0.03
+ 
+float filteredVoltage = 0;
+float filteredPercent = 0;
+ 
+/**********************
+   NON-LINEAR 48V LITHIUM SOC MAP
+   100% = 54.0V
+   0%   = 41.0V
+**********************/
+float lithiumPercent(float v) {
+ 
+  if (v >= 54.0) return 100.0;
+ 
+  // 90–100 %
+  if (v >= 53.2)
+    return 90.0 + (v - 53.2) * 10.0 / 0.8;
+ 
+  // 80–90 %
+  if (v >= 51.8)
+    return 80.0 + (v - 51.8) * 10.0 / 1.4;
+ 
+  // 50–80 %
+  if (v >= 48.8)
+    return 50.0 + (v - 48.8) * 30.0 / 3.0;
+ 
+  // 20–50 %
+  if (v >= 45.5)
+    return 20.0 + (v - 45.5) * 30.0 / 3.3;
+ 
+  // 0–20 %
+  if (v >= 41.0)
+    return (v - 41.0) * 20.0 / 4.5;
+ 
+  return 0.0;
+}
+ 
+/**********************
+   WIFI CONNECT
+**********************/
+void connectWiFi() {
+  WiFi.setSleep(false);
+  if (WiFi.status() == WL_CONNECTED) return;
+ 
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(ssid, password);
+  int tries = 0;
+ 
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    if (++tries > 40) {
+      Serial.println(" WiFi failed. Restarting...");
+      ESP.restart();
+    }
+  }
+  Serial.println("\nWiFi Connected!");
+}
+ 
+/**********************
+   OTA INITIALIZATION
+**********************/
+void setupOTA() {
+  ArduinoOTA.setHostname("BatteryMonitorOTA");
+ 
+  ArduinoOTA
+    .onStart([]() { Serial.println("OTA Update Started..."); })
+    .onEnd([]() { Serial.println("\nOTA Update Finished!"); })
+    .onProgress([](unsigned int progress, unsigned int total) {
+      Serial.printf("OTA Progress: %u%%\r", (progress * 100) / total);
+    })
+    .onError([](ota_error_t error) {
+      Serial.printf("OTA Error[%u]: ", error);
+      if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+      else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+      else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+      else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+      else if (error == OTA_END_ERROR) Serial.println("End Failed");
+    });
+ 
+  ArduinoOTA.begin();
+  Serial.println("OTA Ready!");
+}
+ 
+/**********************
+   HTTPS POST RETRY
+**********************/
+int reliableHttpsPost(const char* jsonPayload) {
+ 
+  for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+ 
+    WiFiClientSecure client;
+    client.setInsecure();
+ 
+    if (client.connect(api_host, api_port)) {
+ 
+      HTTPClient http;
+      http.setTimeout(TIMEOUT_MS);
+ 
+      if (http.begin(client, api_url)) {
+ 
+        http.addHeader("Content-Type", "application/json");
+        http.addHeader("x-api-key", api_key);
+ 
+        int code = http.POST((uint8_t*)jsonPayload, strlen(jsonPayload));
+ 
+        if (code > 0) {
+          http.end();
+          client.stop();
+          return code;
+        }
+        http.end();
+      }
+    }
+ 
+    client.stop();
+    delay(BASE_BACKOFF * attempt);
+  }
+  return -1;
+}
+ 
+/**********************
+   SETUP
+**********************/
+void setup() {
+  Serial.begin(115200);
+  analogReadResolution(12);
+ 
+  connectWiFi();
+  setupOTA();
+}
+ 
+/**********************
+   LOOP
+**********************/
+void loop() {
+ 
+  ArduinoOTA.handle();
+ 
+  /******** AC DETECTION ********/
+  int minVal = 4095, maxVal = 0;
+ 
+  for (int i = 0; i < 800; i++) {
+    int v = analogRead(ZMPT_PIN);
+    minVal = min(minVal, v);
+    maxVal = max(maxVal, v);
+  }
+ 
+  int peakToPeak = maxVal - minVal;
+  int newState = (peakToPeak > ac_threshold) ? 1 : 0;
+ 
+  if (newState != acState) {
+    if (millis() - lastChangeTime > 300) acState = newState;
+  } else {
+    lastChangeTime = millis();
+  }
+ 
+  const char* status = acState ? "electricity" : "no_electricity";
+ 
+  /******** DC VOLTAGE (FILTERED) ********/
+  long dcSum = 0;
+  for (int i = 0; i < DC_SAMPLES; i++) {
+    dcSum += analogRead(DC_PIN);
+    delayMicroseconds(200);
+  }
+ 
+  float rawDC = dcSum / (float)DC_SAMPLES;
+  float Vin;
+ 
+  if (rawDC <= raw_46)
+    Vin = rawDC * slope1;
+  else
+    Vin = 46.0 + (rawDC - raw_46) * slope2;
+ 
+  if (filteredVoltage == 0)
+    filteredVoltage = Vin;
+  else
+    filteredVoltage = (VOLT_ALPHA * Vin) +
+                      ((1 - VOLT_ALPHA) * filteredVoltage);
+ 
+  /******** BATTERY SOC (NON-LINEAR + FILTERED) ********/
+  float batt_percent = lithiumPercent(filteredVoltage);
+ 
+  if (filteredPercent == 0)
+    filteredPercent = batt_percent;
+  else
+    filteredPercent = (PERC_ALPHA * batt_percent) +
+                      ((1 - PERC_ALPHA) * filteredPercent);
+ 
+  /******** LOG ********/
+  Serial.println("\n=========== SENSOR DATA ===========");
+  Serial.print("Battery Voltage: ");
+  Serial.println(filteredVoltage, 2);
+  Serial.print("Battery SOC (%): ");
+  Serial.println(filteredPercent, 1);
+  Serial.print("AC Status: ");
+  Serial.println(status);
+  Serial.println("==================================");
+ 
+  /******** JSON ********/
+  char jsonBuf[180];
+  snprintf(jsonBuf, sizeof(jsonBuf),
+    "{\"battery_id\":\"1\",\"battery_percentage\":\"%.1f\",\"battery_status\":\"%s\"}",
+    filteredPercent, status);
+ 
+  reliableHttpsPost(jsonBuf);
+  delay(5000);
+}
